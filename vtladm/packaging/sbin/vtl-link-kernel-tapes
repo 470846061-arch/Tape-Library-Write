@@ -1,0 +1,124 @@
+#!/bin/sh
+# Link per-library .vtltape files into tape_dir root for vtl.ko (flat tape_dir/{name}.vtltape).
+# Supports: tape_dir/<lib>/*.vtltape and tape_dir/<lib>/tape/*.vtltape
+# Requires globally unique tape *names* across libraries (use {lib}_tapeNN auto names).
+# vtladm robot sync also runs equivalent logic automatically before ioctl.
+set -eu
+
+TAPE_ROOT="${VTL_TAPE_ROOT:-/opt/vtladm/var/tapes}"
+
+if [ ! -d "$TAPE_ROOT" ]; then
+  echo "vtl-link-kernel-tapes: missing $TAPE_ROOT" >&2
+  exit 1
+fi
+
+linked=0
+conflicts=0
+removed_stale=0
+relocated_flat=0
+
+# shellcheck disable=SC2012
+for libdir in "$TAPE_ROOT"/*/; do
+  [ -d "$libdir" ] || continue
+  lib=$(basename "$libdir")
+  case "$lib" in __offline__) continue ;; esac
+
+  for f in "$libdir"/*.vtltape "$libdir"/tape/*.vtltape; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f")
+    dest="$TAPE_ROOT/$base"
+    src=$(readlink -f "$f" 2>/dev/null || realpath "$f" 2>/dev/null || echo "$f")
+    if [ -e "$dest" ]; then
+      old=$(readlink -f "$dest" 2>/dev/null || echo "$dest")
+      if [ "$old" != "$src" ]; then
+        if [ -f "$dest" ] && [ ! -L "$dest" ]; then
+          rm -f "$dest"
+        else
+          echo "CONFLICT: $lib/$base vs existing $dest" >&2
+          conflicts=$((conflicts + 1))
+          continue
+        fi
+      else
+        if [ -L "$dest" ]; then
+          rm -f "$dest"
+          if ln "$src" "$dest" 2>/dev/null; then
+            linked=$((linked + 1))
+          else
+            ln -sf "$src" "$dest"
+            linked=$((linked + 1))
+          fi
+        fi
+      fi
+    fi
+    if [ ! -e "$dest" ]; then
+      if ln "$src" "$dest" 2>/dev/null; then
+        linked=$((linked + 1))
+      else
+        ln -sf "$src" "$dest"
+        linked=$((linked + 1))
+      fi
+    fi
+  done
+done
+
+for dest in "$TAPE_ROOT"/*.vtltape; do
+  [ -f "$dest" ] || continue
+  base=$(basename "$dest")
+  if [ -f "$dest" ] && [ ! -L "$dest" ]; then
+    found_flat=0
+    same_inode=0
+    for libdir in "$TAPE_ROOT"/*/; do
+      [ -d "$libdir" ] || continue
+      lib=$(basename "$libdir")
+      case "$lib" in __offline__|_orphaned_root) continue ;; esac
+      for f in "$libdir/$base" "$libdir/tape/$base"; do
+        if [ -f "$f" ]; then
+          found_flat=1
+          d_ino=$(stat -c '%d:%i' "$dest" 2>/dev/null || true)
+          f_ino=$(stat -c '%d:%i' "$f" 2>/dev/null || true)
+          if [ -n "$d_ino" ] && [ "$d_ino" = "$f_ino" ]; then
+            same_inode=1
+          fi
+          break 2
+        fi
+      done
+    done
+    if [ "$found_flat" -eq 1 ] && [ "$same_inode" -eq 1 ]; then
+      :
+    elif [ "$found_flat" -eq 1 ]; then
+      echo "CONFLICT: flat root file $dest vs library copy" >&2
+      conflicts=$((conflicts + 1))
+    else
+      mkdir -p "$TAPE_ROOT/_orphaned_root"
+      mv -f "$dest" "$TAPE_ROOT/_orphaned_root/$base"
+      relocated_flat=$((relocated_flat + 1))
+    fi
+    continue
+  fi
+  [ -L "$dest" ] || continue
+  found=0
+  for libdir in "$TAPE_ROOT"/*/; do
+    [ -d "$libdir" ] || continue
+    lib=$(basename "$libdir")
+    case "$lib" in __offline__) continue ;; esac
+    for f in "$libdir/$base" "$libdir/tape/$base"; do
+      if [ -f "$f" ]; then
+        found=1
+        break 2
+      fi
+    done
+  done
+  target=$(readlink -f "$dest" 2>/dev/null || true)
+  if [ "$found" -eq 0 ] || [ -z "$target" ] || [ ! -e "$target" ]; then
+    rm -f "$dest"
+    removed_stale=$((removed_stale + 1))
+  fi
+done
+
+echo "vtl-link-kernel-tapes: linked=$linked removed_stale=$removed_stale relocated_flat=$relocated_flat conflicts=$conflicts root=$TAPE_ROOT"
+if [ -w /sys/module/vtl/parameters/tape_dir ] 2>/dev/null; then
+  printf '%s' "$TAPE_ROOT" > /sys/module/vtl/parameters/tape_dir
+  echo "vtl-link-kernel-tapes: tape_dir=$TAPE_ROOT"
+fi
+
+[ "$conflicts" -eq 0 ] || exit 2

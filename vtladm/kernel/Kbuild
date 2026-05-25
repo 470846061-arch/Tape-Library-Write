@@ -1,0 +1,4 @@
+obj-m += vtl.o
+vtl-objs := src/vtl_main.o src/vtl_personality.o src/vtl_scsi.o src/vtl_tape.o src/vtl_sysfs.o src/vtl_misc.o
+
+ccflags-y := -I$(src)/include

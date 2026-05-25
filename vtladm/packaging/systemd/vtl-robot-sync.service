@@ -1,0 +1,10 @@
+[Unit]
+Description=VTL kernel to DB inventory sync (backup software changer)
+After=vtl-kernel.service
+Wants=vtl-kernel.service
+
+[Service]
+Type=oneshot
+Environment=VTL_PREFIX=/opt/vtladm
+Environment=VTL_VAR=/opt/vtladm/var
+ExecStart=/opt/vtladm/scripts/vtl-robot-sync.sh

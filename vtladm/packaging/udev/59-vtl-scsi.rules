@@ -1,0 +1,13 @@
+# VTL virtual tape library (vtl.ko) — Linux 4.18–6.10
+# Skip scsi_id on VTL SCSI nodes. During scsi_scan_host/st_probe, udev scsi_id can race
+# sysfs/slab (seen on Kylin 4.19, openEuler 6.6, VMware guests).
+# Must sort before 60-persistent-storage.rules (59 < 60).
+
+ACTION!="add|change", GOTO="vtl_scsi_end"
+
+SUBSYSTEM=="scsi", KERNEL=="[0-9]*:[0-9]*:[0-9]*:[0-9]*", ATTRS{vendor}=="VTL*", ENV{ID_SCSI}="skip"
+SUBSYSTEM=="scsi_generic", ATTRS{vendor}=="VTL*", ENV{ID_SCSI}="skip"
+KERNEL=="st*|nst*", SUBSYSTEMS=="scsi", ATTRS{vendor}=="VTL*", ENV{ID_SCSI}="skip"
+KERNEL=="sg*", SUBSYSTEMS=="scsi", ATTRS{vendor}=="VTL*", ENV{ID_SCSI}="skip"
+
+LABEL="vtl_scsi_end"

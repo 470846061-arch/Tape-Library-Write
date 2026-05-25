@@ -1,0 +1,25 @@
+[Unit]
+Description=VTL administration Web UI (vtladm serve)
+Documentation=file:///opt/vtladm/docs/STACK.md
+After=network.target vtl-kernel.service
+Wants=vtl-kernel.service
+ConditionPathExists=/opt/vtladm/bin/vtladm
+
+[Service]
+Type=simple
+Environment=PATH=/sbin:/usr/sbin:/bin:/usr/bin
+Environment=VTL_CONF_PATH=/opt/vtladm/var/vtl.conf
+WorkingDirectory=/opt/vtladm/var
+# Web bind vars come from /etc/default/vtladm via vtladm-web-serve (CRLF-safe); do not use EnvironmentFile here.
+ExecStartPre=/bin/sh -c 'test -f /etc/default/vtladm && sed -i "s/\\r$//" /etc/default/vtladm || true'
+ExecStartPre=/bin/sh -c 'sed -i "s/\\r$//" /opt/vtladm/sbin/vtladm-web-serve 2>/dev/null || true'
+ExecStart=/opt/vtladm/sbin/vtladm-web-serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/vtladm/var /etc/default/vtladm /opt/vtladm/sbin/vtladm-web-serve /etc/target /sys/kernel/config
+
+[Install]
+WantedBy=multi-user.target

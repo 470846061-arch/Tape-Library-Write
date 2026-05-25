@@ -1,0 +1,417 @@
+#!/bin/sh
+# Load/unload vtl.ko from /opt/vtladm. Uses holder checks before rmmod (Kylin safety).
+set -eu
+
+PREFIX="${VTL_PREFIX:-/opt/vtladm}"
+DEFAULTS="/etc/default/vtladm"
+if [ -f "$PREFIX/scripts/vtl-source-defaults.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$PREFIX/scripts/vtl-source-defaults.sh"
+  _vtl_source_defaults "$DEFAULTS"
+elif [ -f "$DEFAULTS" ]; then
+  _t=$(mktemp "${TMPDIR:-/tmp}/vtladm-defaults.XXXXXX") || exit 1
+  sed 's/\r$//' "$DEFAULTS" > "$_t" && . "$_t"
+  rm -f "$_t"
+fi
+
+VTL_KO="${VTL_KO:-$PREFIX/ko/vtl.ko}"
+VTL_INSTANCES="${VTL_INSTANCES:-}"
+VTL_INSMOD_EXTRA="${VTL_INSMOD_EXTRA:-}"
+VTL_TAPE_DIR="${VTL_TAPE_DIR:-/opt/vtladm/var/tapes}"
+
+SCRIPT_DIR="$PREFIX/scripts"
+
+usage() {
+  echo "usage: $0 start|stop|status|reload" >&2
+  exit 2
+}
+
+_insmod_bin() {
+  if command -v insmod >/dev/null 2>&1; then
+    command -v insmod
+    return 0
+  fi
+  for _p in /sbin/insmod /usr/sbin/insmod; do
+    if [ -x "$_p" ]; then
+      echo "$_p"
+      return 0
+    fi
+  done
+  echo "insmod not found (install kmod)" >&2
+  return 1
+}
+
+_modprobe_bin() {
+  if command -v modprobe >/dev/null 2>&1; then
+    command -v modprobe
+    return 0
+  fi
+  for _p in /sbin/modprobe /usr/sbin/modprobe; do
+    if [ -x "$_p" ]; then
+      echo "$_p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+vtl_loaded() {
+  lsmod 2>/dev/null | awk '{print $1}' | grep -qx vtl
+}
+
+# Warn when LIO still has pscsi backstores (stale /dev/sg after rmmod can corrupt the next insmod).
+_warn_lio_pscsi_before_insmod() {
+  if [ -f "$SCRIPT_DIR/vtl-scsi-holders.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$SCRIPT_DIR/vtl-scsi-holders.sh"
+    if vtl_loaded && lio_pscsi_references_vtl_sg; then
+      echo "WARN: LIO pscsi still references VTL /dev/sg — unexport before reload (vtladm-iscsi library-unexport)" >&2
+      return 1
+    fi
+  fi
+  if [ -d /sys/kernel/config/target/core/pscsi_0 ] 2>/dev/null; then
+    :
+  elif command -v targetcli >/dev/null 2>&1; then
+    _pscsi=$(timeout 15 targetcli ls /backstores/pscsi 2>/dev/null) || _pscsi=""
+    if [ -n "$_pscsi" ] && printf '%s\n' "$_pscsi" | grep -qE '/dev/sg|/dev/st'; then
+      echo "WARN: targetcli lists pscsi backstores; clear or unexport before insmod to avoid kernel faults" >&2
+      echo "  vtladm-iscsi library-unexport …  or  targetcli clearconfig confirm=true" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+_check_ko_vermagic() {
+  if ! command -v modinfo >/dev/null 2>&1; then
+    return 0
+  fi
+  _want=$(uname -r)
+  _vm=$(modinfo -F vermagic "$VTL_KO" 2>/dev/null | awk '{print $1}')
+  if [ -z "$_vm" ]; then
+    echo "WARN: modinfo could not read vermagic from $VTL_KO" >&2
+    return 0
+  fi
+  case "$_vm" in
+    "$_want"*) return 0 ;;
+    *)
+      echo "vermagic mismatch: ko=$_vm running=$_want" >&2
+      echo "rebuild vtl.ko on this host: cd vtladm && sudo sh install.sh" >&2
+      return 1
+      ;;
+  esac
+}
+
+_insmod_fail_help() {
+  echo "insmod/modprobe failed for $VTL_KO" >&2
+  if command -v modinfo >/dev/null 2>&1; then
+    echo "modinfo:" >&2
+    modinfo "$VTL_KO" 2>&1 | sed 's/^/  /' >&2 || true
+  fi
+  if command -v dmesg >/dev/null 2>&1; then
+    echo "dmesg (last 20 lines):" >&2
+    dmesg 2>/dev/null | tail -20 | sed 's/^/  /' >&2 || true
+  fi
+}
+
+# DB / vtl.conf / VTL_INSTANCES — prefer insmod-time geometry over hot ioctl.
+_plan_b_insmod_spec() {
+  _vtladm="${VTLADM_BIN:-$PREFIX/bin/vtladm}"
+  if [ -x "$_vtladm" ]; then
+    _spec=$("$_vtladm" kernel-spec --insmod-max 2>/dev/null) || _spec=""
+    if [ -n "$_spec" ]; then
+      printf '%s' "$_spec"
+      return 0
+    fi
+  fi
+  printf '%s' "8x256,8x256,8x256,8x256,8x256,8x256,8x256,8x256"
+}
+
+_resolve_vtl_instances_spec() {
+  if [ -n "${VTL_INSTANCES:-}" ]; then
+    printf '%s' "$VTL_INSTANCES"
+    return 0
+  fi
+  _conf="${VTL_CONF_PATH:-$PREFIX/var/vtl.conf}"
+  if [ -f "$_conf" ]; then
+    _mode=$(grep -E '^[[:space:]]*kernel_geometry_mode[[:space:]]*=' "$_conf" 2>/dev/null | tail -1 || true)
+    _mode=${_mode#*=}
+    _mode=$(printf '%s' "$_mode" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')
+    case "$_mode" in
+      fixed|plan_b|semi_thin)
+        VTL_RESOLVED_PLAN_B=1
+        export VTL_RESOLVED_PLAN_B
+        _plan_b_insmod_spec
+        return 0
+        ;;
+    esac
+    _line=$(grep -E '^[[:space:]]*vtl_instances[[:space:]]*=' "$_conf" 2>/dev/null | tail -1 || true)
+    if [ -n "$_line" ]; then
+      _val=${_line#*=}
+      _val=$(printf '%s' "$_val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      if [ -n "$_val" ]; then
+        printf '%s' "$_val"
+        return 0
+      fi
+    fi
+  fi
+  _vtladm="${VTLADM_BIN:-$PREFIX/bin/vtladm}"
+  if [ -x "$_vtladm" ] && [ -f "$PREFIX/var/vtl.db" ]; then
+    _spec=$("$_vtladm" kernel-spec 2>/dev/null) || _spec=""
+    if [ -n "$_spec" ]; then
+      printf '%s' "$_spec"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+_read_sysfs_vtl_instances() {
+  if [ -r /sys/module/vtl/parameters/vtl_instances ]; then
+    tr -d '\n' </sys/module/vtl/parameters/vtl_instances 2>/dev/null || true
+  fi
+}
+
+_post_start_check_db_geometry() {
+  _conf="${VTL_CONF_PATH:-$PREFIX/var/vtl.conf}"
+  if [ -f "$_conf" ] && grep -qE '^[[:space:]]*kernel_geometry_mode[[:space:]]*=[[:space:]]*(fixed|plan_b|semi_thin)' "$_conf" 2>/dev/null; then
+    _have=$(_read_sysfs_vtl_instances)
+    _db=$("${VTLADM_BIN:-$PREFIX/bin/vtladm}" kernel-spec 2>/dev/null) || _db=""
+    if [ -n "$_have" ] && [ -n "$_db" ]; then
+      echo "vtl: Plan B insmod ($_have); DB runtime spec is $_db — use vtladm kernel-align after library changes"
+    fi
+    return 0
+  fi
+  _want=$(_resolve_vtl_instances_spec 2>/dev/null) || _want=""
+  [ -n "$_want" ] || return 0
+  _have=$(_read_sysfs_vtl_instances)
+  if [ -n "$_have" ] && [ "$_want" = "$_have" ]; then
+    echo "vtl: kernel geometry matches DB ($_want)"
+    return 0
+  fi
+  echo "vtl: WARNING: sysfs vtl_instances=${_have:-empty} != DB ($_want)" >&2
+  echo "vtl: run after unexport/stop backup: $0 reload" >&2
+  return 0
+}
+
+_read_personality_from_conf() {
+  if [ -n "${VTL_PERSONALITY:-}" ]; then
+    printf '%s' "$VTL_PERSONALITY"
+    return 0
+  fi
+  _conf="${VTL_CONF_PATH:-$PREFIX/var/vtl.conf}"
+  if [ -f "$_conf" ]; then
+    _line=$(grep -E '^[[:space:]]*personality[[:space:]]*=' "$_conf" 2>/dev/null | tail -1 || true)
+    if [ -n "$_line" ]; then
+      _val=${_line#*=}
+      _val=$(printf '%s' "$_val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      if [ -n "$_val" ]; then
+        printf '%s' "$_val"
+        return 0
+      fi
+    fi
+  fi
+  printf '%s' "vtl"
+}
+
+_do_insmod() {
+  _insmod=$(_insmod_bin) || return 1
+  _args="tape_dir=${VTL_TAPE_DIR}"
+  _pers=$(_read_personality_from_conf)
+  if ! printf '%s %s' "$_args" "${VTL_INSMOD_EXTRA:-}" | grep -q 'personality='; then
+    _args="$_args personality=${_pers}"
+  fi
+  _resolved=""
+  if _resolved=$(_resolve_vtl_instances_spec 2>/dev/null); then
+    :
+  else
+    _resolved=""
+  fi
+  if [ -n "$_resolved" ]; then
+    VTL_INSTANCES="$_resolved"
+    _args="$_args vtl_instances=${VTL_INSTANCES}"
+  elif [ -n "$VTL_INSTANCES" ]; then
+    _args="$_args vtl_instances=${VTL_INSTANCES}"
+  fi
+  # shellcheck disable=SC2086
+  set -- $_args $VTL_INSMOD_EXTRA
+  if [ "${VTL_RESOLVED_PLAN_B:-}" = "1" ]; then
+    unset VTL_RESOLVED_PLAN_B
+    case " $* " in
+      *" noscan="*) ;;
+      *)
+        if [ -z "${VTL_INSMOD_EXTRA:-}" ] || ! printf '%s' "$VTL_INSMOD_EXTRA" | grep -q 'noscan='; then
+          set -- "$@" noscan=1
+        fi
+        ;;
+    esac
+  fi
+  echo "insmod $VTL_KO $*"
+  # shellcheck disable=SC2068
+  if "$_insmod" "$VTL_KO" "$@"; then
+    return 0
+  fi
+  _mp=$(_modprobe_bin 2>/dev/null) || _mp=""
+  if [ -n "$_mp" ] && [ -f "/lib/modules/$(uname -r)/extra/vtl.ko" ]; then
+    echo "trying: modprobe vtl $*" >&2
+    # shellcheck disable=SC2068
+    if "$_mp" vtl "$@"; then
+      return 0
+    fi
+  fi
+  _insmod_fail_help
+  return 1
+}
+
+cmd_start() {
+  if vtl_loaded; then
+    echo "vtl: already loaded"
+    _post_start_check_db_geometry
+    return 0
+  fi
+  if [ ! -f "$VTL_KO" ]; then
+    echo "vtl.ko not found: $VTL_KO" >&2
+    exit 1
+  fi
+  _check_ko_vermagic || exit 1
+  _warn_lio_pscsi_before_insmod || true
+  if [ -f "$SCRIPT_DIR/vtl-scsi-holders.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$SCRIPT_DIR/vtl-scsi-holders.sh"
+    vtl_dmesg_mark || true
+  fi
+  _do_insmod || exit 1
+  echo "vtl: loaded (kernel $(uname -r); supported range 4.18–6.10)"
+  if [ -f "$SCRIPT_DIR/vtl-scsi-holders.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$SCRIPT_DIR/vtl-scsi-holders.sh"
+    vtl_post_insmod_settle
+    if vtl_dmesg_recent_panic; then
+      echo "ERROR: kernel panic/oops detected in dmesg after insmod — check /var/crash or kdump" >&2
+      exit 1
+    fi
+  else
+    sleep 8
+  fi
+  _post_start_check_db_geometry
+}
+
+cmd_stop() {
+  _post_rmmod="${VTL_POST_RMMOD_WAIT_SEC:-}"
+  _holders=0
+  if ! vtl_loaded; then
+    echo "vtl: not loaded"
+    return 0
+  fi
+  if [ -f "$PREFIX/scripts/vtl-kernel-safe.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$PREFIX/scripts/vtl-kernel-safe.sh"
+    vtl_vtladm_timers_stop
+    # Do not targetcli clearconfig here (systemctl stop vtl-kernel); refuse if LIO still holds sg.
+    vtl_preflight_before_rmmod || exit 1
+  fi
+  if [ -f "$SCRIPT_DIR/vtl-scsi-holders.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$SCRIPT_DIR/vtl-scsi-holders.sh"
+    _holders=1
+    if [ -z "$_post_rmmod" ]; then
+      _ms=$(vtl_sysfs_int_param rmmod_quiesce_ms 12000)
+      _post_rmmod=$((_ms / 1000 + 5))
+      [ "$_post_rmmod" -lt 15 ] && _post_rmmod=15
+      [ "$_post_rmmod" -gt 120 ] && _post_rmmod=120
+    fi
+    if refuse_rmmod_vtl_safety; then
+      check_vtl_scsi_holders
+      _rc=$?
+      if [ "$_rc" -eq 2 ]; then
+        echo "refusing rmmod: fuser not installed (install psmisc)" >&2
+        exit 1
+      fi
+      echo "refusing rmmod: VTL /dev/st*|sg* in use — stop backup or use ioctl-only geometry changes" >&2
+      exit 1
+    fi
+    if lio_pscsi_references_vtl_sg; then
+      echo "refusing rmmod: LIO pscsi still references VTL /dev/sg" >&2
+      echo "  Run Web library-unexport or: vtladm-iscsi library-unexport --id <prefix> --iqn <iqn>" >&2
+      echo "  Or: targetcli clearconfig confirm=true" >&2
+      echo "  Override (risky): VTL_FORCE_RMMOD=1 $0 stop" >&2
+      exit 1
+    fi
+    echo "removing VTL SCSI devices via sysfs before rmmod..."
+    delete_vtl_scsi_devices || true
+    vtl_wait_before_rmmod
+    if [ "${VTL_FORCE_RMMOD:-}" != "1" ] && vtl_scsi_devices_remain; then
+      echo "refusing rmmod: VTL SCSI devices still present after sysfs delete" >&2
+      vtl_diagnose_rmmod_failure
+      exit 1
+    fi
+  fi
+  if ! rmmod vtl 2>/dev/null; then
+    echo "rmmod vtl failed: module still in use" >&2
+    vtl_diagnose_rmmod_failure
+    echo "  1) vtladm-iscsi library-unexport (per library) or targetcli delete pscsi/iscsi" >&2
+    echo "  2) confirm: lsscsi -g | grep -i VTL is empty" >&2
+    echo "  3) vtladm patrol  (DB vs LIO alignment)" >&2
+    exit 1
+  fi
+  echo "vtl: unloaded"
+  if [ -f "$PREFIX/scripts/vtl-kernel-safe.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$PREFIX/scripts/vtl-kernel-safe.sh"
+    vtl_post_rmmod_wait "$_post_rmmod"
+    if [ "$_holders" = 1 ] && vtl_dmesg_recent_panic; then
+      echo "ERROR: kernel panic/oops after rmmod — see /var/crash and dmesg" >&2
+      exit 1
+    fi
+  elif [ "$_holders" = 1 ]; then
+    vtl_wait_after_rmmod "$_post_rmmod"
+  else
+    [ -z "$_post_rmmod" ] && _post_rmmod=15
+    sleep "$_post_rmmod"
+  fi
+}
+
+cmd_status() {
+  if vtl_loaded; then
+    echo "vtl: loaded"
+    if [ -r /sys/module/vtl/parameters/vtl_instances ]; then
+      echo -n "vtl_instances(sysfs): "
+      cat /sys/module/vtl/parameters/vtl_instances 2>/dev/null || true
+      echo
+    fi
+    if command -v lsscsi >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/vtl-scsi-holders.sh" ]; then
+      # shellcheck source=/dev/null
+      . "$SCRIPT_DIR/vtl-scsi-holders.sh"
+      for _h in $(vtl_scsi_hctl_list); do
+        lsscsi -g 2>/dev/null | grep -F "[$_h" || true
+      done
+    fi
+  else
+    echo "vtl: not loaded"
+    exit 1
+  fi
+}
+
+cmd_reload() {
+  if [ -f "$PREFIX/scripts/vtl-kernel-safe.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$PREFIX/scripts/vtl-kernel-safe.sh"
+    vtl_safe_reload "${PREFIX}/sbin/vtl-kernelctl" || exit 1
+    return 0
+  fi
+  if [ -f "$SCRIPT_DIR/vtl-scsi-holders.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$SCRIPT_DIR/vtl-scsi-holders.sh"
+    vtl_dmesg_mark || true
+  fi
+  cmd_stop
+  cmd_start
+}
+
+case "${1:-}" in
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  status) cmd_status ;;
+  reload) cmd_reload ;;
+  *) usage ;;
+esac

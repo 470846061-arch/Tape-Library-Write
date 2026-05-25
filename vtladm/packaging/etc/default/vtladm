@@ -1,0 +1,25 @@
+# /etc/default/vtladm — sourced by vtl-kernelctl and optional patrol.
+# Copy to /etc/default/vtladm on install (install.sh does this).
+# Platform: Linux kernel 4.18–6.10 (build vtl.ko on each host for that uname -r).
+
+# Path to vtl.ko (built for the kernel running at install time).
+VTL_KO=/opt/vtladm/ko/vtl.ko
+
+# Comma-separated NxM per SCSI host, e.g. 2x10 or 8x256,8x256,... (max 8 segments).
+# Empty = vtl-kernelctl derives spec from vtl.conf:
+#   kernel_geometry_mode=fixed|plan_b → `vtladm kernel-spec --insmod-max` (8×8×256 Plan B, noscan=1)
+#   else → `vtladm kernel-spec` from vtl.db (legacy).
+VTL_INSTANCES=
+
+# Tape images directory (kernel module_param tape_dir; align with vtl.conf tape_dir).
+VTL_TAPE_DIR=/opt/vtladm/var/tapes
+
+# Extra insmod arguments (scan delays, etc.). Must be quoted — unquoted spaces break shell source in vtladm-web-serve.
+VTL_INSMOD_EXTRA="scan_delay_ms=500 post_add_scan_delay_ms=600 bringup_stagger_ms=400 scan_host_stagger_ms=3000 scan_async_quiesce_ms=5000 rmmod_quiesce_ms=12000"
+
+# Web UI (vtladm-web.service)
+VTLADM_WEB_HOST=0.0.0.0
+VTLADM_WEB_PORT=8765
+
+# Patrol: warn if DB spec cache differs from sysfs (best-effort).
+VTL_PATROL_STRICT=0

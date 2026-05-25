@@ -1,0 +1,11 @@
+[Unit]
+Description=VTL stack patrol (vtl.ko + lsscsi + vtladm)
+Documentation=file:///opt/vtladm/docs/STACK.md
+After=vtl-kernel.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sh -c 'test -f /etc/default/vtladm && sed -i "s/\\r$//" /etc/default/vtladm || true'
+ExecStart=/opt/vtladm/bin/vtladm patrol
+Environment=VTL_PREFIX=/opt/vtladm
+Environment=VTL_VAR=/opt/vtladm/var

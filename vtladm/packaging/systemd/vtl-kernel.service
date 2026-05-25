@@ -1,0 +1,17 @@
+[Unit]
+Description=Virtual Tape Library kernel module (vtl.ko)
+Documentation=file:///opt/vtladm/docs/STACK.md
+DefaultDependencies=no
+Before=vtladm-web.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PATH=/sbin:/usr/sbin:/bin:/usr/bin
+ExecStartPre=/bin/sh -c 'test -f /etc/default/vtladm && sed -i "s/\\r$//" /etc/default/vtladm || true'
+ExecStart=/opt/vtladm/sbin/vtl-kernelctl start
+ExecStop=/opt/vtladm/sbin/vtl-kernelctl stop
+
+[Install]
+WantedBy=multi-user.target

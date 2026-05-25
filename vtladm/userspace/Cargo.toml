@@ -1,0 +1,48 @@
+[package]
+name = "vtladm"
+version = "0.1.0"
+# 2018：极旧 Cargo 不认 `edition = "2021"`；与源码兼容。
+#
+# 工具链下限（与依赖声明一致，非随意抬高）：
+# - `axum` 0.7.5 要求 rustc ≥ 1.66；本仓库 `web_auth` 等还使用需 rustc ≥ 1.65 的语法。
+# - **Cargo 1.51 / rustc 1.51 无法构建当前依赖栈**（会报无法选中 axum 0.7 等）。Linux 构建机请使用
+#   发行版较新 rust、容器内 rustc，或在能接受的策略下安装较新 Cargo（不必是 rustup）。
+# - **仅 Linux、64 位**（`build.rs` 检查 `target_os=linux` 与 `target_pointer_width=64`）。
+#   在 Windows/macOS 上请交叉编译：`--target x86_64-unknown-linux-gnu` 或 `aarch64-unknown-linux-gnu`
+edition = "2018"
+description = "VTL (Virtual Tape Library) Administration Tool"
+license = "GPL-2.0"
+build = "build.rs"
+
+# Explicit root binary (some Cargo versions skip src/main.rs when other [[bin]] exist).
+[[bin]]
+name = "vtladm"
+path = "src/main.rs"
+
+[[bin]]
+name = "vtladm-iscsi"
+path = "src/bin/vtladm_iscsi.rs"
+
+[dependencies]
+clap = { version = "=4.0.32", features = ["derive"] }
+libc = "0.2.153"
+serde = { version = "1.0.193", features = ["derive"] }
+serde_json = "1.0.108"
+rand = "0.8.5"
+sha2 = "=0.10.8"
+chrono = "0.4.31"
+rusqlite = { version = "0.29.0", features = ["chrono"] }
+thiserror = "1.0.50"
+axum = "0.7.5"
+axum-extra = { version = "0.9.4", features = ["cookie"] }
+tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "net"] }
+bcrypt = "0.15"
+# Caret "1.8" resolves to 1.23+ on Linux, which pulls getrandom 0.4.x (manifest needs Cargo edition2024).
+uuid = { version = "=1.8.0", features = ["v4"] }
+# axum-extra -> cookie -> time -> time-core; time-core 0.1.8+ needs newer Cargo (edition2024).
+# Same for any crate with edition2024 manifests: pin versions, use --locked, or upgrade Cargo.
+# Applies to Linux build servers with distro Cargo (e.g. 1.82) as well as Windows.
+time = { version = "=0.3.36", default-features = false, features = ["std", "parsing", "formatting", "macros"] }
+
+[dev-dependencies]
+tower = { version = "0.4.13", features = ["util"] }
