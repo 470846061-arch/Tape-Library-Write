@@ -2367,7 +2367,7 @@ fn scan_vtl_library_blocking(
     let conn = super::init_db().map_err(|e| e.to_string())?;
     if let Err(e) = super::build_vtl_instances_kernel_spec() {
         return Err(format!(
-            "无已导出在线库（不含测试库 default）：{}；请先 library create 并 vtl-kernelctl reload",
+            "无已导出在线库：{}；请先 library create 并 vtl-kernelctl reload",
             e
         ));
     }
@@ -4396,7 +4396,7 @@ function applyProductLimitsFromApi(j){
   if(h){h.innerHTML='产品上限：在线库最多 <strong>'+VTL_LIMITS.max_online_libraries+'</strong> 个；每库最多 <strong>'+VTL_LIMITS.max_drives_per_library+'</strong> 台驱动器、<strong>'+VTL_LIMITS.max_data_slots_per_library+'</strong> 个数据槽。内核可能枚举更多磁带 LUN，界面与导出<strong>仅使用前 N 台</strong>（N = 建库驱动数）。';}
 }
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function onlineLibs(j){return (j.libraries||[]).filter(l=>{const n=l.name||'';if(n==='default'||n==='__offline__')return false;if(l.is_offline_storage)return false;return !!n;});}
+function onlineLibs(j){return (j.libraries||[]).filter(l=>{const n=l.name||'';if(n==='__offline__')return false;if(l.is_offline_storage)return false;return !!n;});}
 async function loadTransportLibs(){
   const sel=document.getElementById('tselib');
   const r=await fetch('/api/libraries',{credentials:'include'});
@@ -4568,7 +4568,7 @@ async function jpost(url,body){
   const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(body)});
   const t=await r.text();let j;try{j=JSON.parse(t);}catch{j={raw:t};}return{r,j};
 }
-function onlineLibs(j){return (j.libraries||[]).filter(l=>!l.is_offline_storage&&l.name!=='default');}
+function onlineLibs(j){return (j.libraries||[]).filter(l=>!l.is_offline_storage&&l.name);}
 document.getElementById('btn-logout').onclick=async()=>{await fetch('/api/logout',{method:'POST',credentials:'include'});location.href='/login';};
 function initTapeTabs(){
   document.querySelectorAll('.ptab').forEach(btn=>{
@@ -4826,7 +4826,7 @@ async function jpost(url,body){
   const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(body)});
   const t=await r.text();let j;try{j=JSON.parse(t);}catch{j={raw:t};}return{r,j};
 }
-function onlineLibs(j){return (j.libraries||[]).filter(l=>!l.is_offline_storage&&l.name!=='default');}
+function onlineLibs(j){return (j.libraries||[]).filter(l=>!l.is_offline_storage&&l.name);}
 let onlineLibCount=0;
 function setUrlLib(name){
   const u=new URL(location.href);
@@ -5027,7 +5027,7 @@ input,select{max-width:100%;}
   const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(body)});
   const t=await r.text();let j;try{j=JSON.parse(t);}catch{j={raw:t};}return{r,j};
 }
-function onlineLibs(j){return (j.libraries||[]).filter(l=>!l.is_offline_storage&&l.name!=='default');}
+function onlineLibs(j){return (j.libraries||[]).filter(l=>!l.is_offline_storage&&l.name);}
 const OFFLINE_LIB='__offline__';
 async function loadDelOnlineLibs(){
   const r=await fetch('/api/libraries',{credentials:'include'});
@@ -5137,7 +5137,7 @@ async function jpost(url,body){
   const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(body)});
   const t=await r.text();let j;try{j=JSON.parse(t);}catch{j={raw:t};}return{r,j};
 }
-function onlineLibs(j){return (j.libraries||[]).filter(l=>!l.is_offline_storage&&l.name!=='default');}
+function onlineLibs(j){return (j.libraries||[]).filter(l=>!l.is_offline_storage&&l.name);}
 document.getElementById('btn-logout').onclick=async()=>{await fetch('/api/logout',{method:'POST',credentials:'include'});location.href='/login';};
 async function loadLibs(){
   const r=await fetch('/api/libraries',{credentials:'include'});
@@ -5257,7 +5257,7 @@ async function jpost(url,body){
   const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(body)});
   const t=await r.text();let j;try{j=JSON.parse(t);}catch{j={raw:t};}return{r,j};
 }
-function onlineLibs(j){return (j.libraries||[]).filter(l=>!l.is_offline_storage&&l.name!=='default');}
+function onlineLibs(j){return (j.libraries||[]).filter(l=>!l.is_offline_storage&&l.name);}
 function assignableTapes(list){return (list||[]).filter(t=>!t.in_drive && t.slot==null);}
 document.getElementById('btn-logout').onclick=async()=>{await fetch('/api/logout',{method:'POST',credentials:'include'});location.href='/login';};
 let lastTapes=[];let lastSlots=[];
@@ -5379,7 +5379,7 @@ async function jpost(url,body){
   const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(body)});
   const t=await r.text();let j;try{j=JSON.parse(t);}catch{j={raw:t};}return{r,j};
 }
-function onlineLibs(j){return (j.libraries||[]).filter(l=>!l.is_offline_storage&&l.name!=='default');}
+function onlineLibs(j){return (j.libraries||[]).filter(l=>!l.is_offline_storage&&l.name);}
 let lastTapes=[];
 document.getElementById('btn-logout').onclick=async()=>{await fetch('/api/logout',{method:'POST',credentials:'include'});location.href='/login';};
 async function loadSh(){
@@ -5566,7 +5566,7 @@ async function jpost(url,body){
 function onlineLibs(j){
   return (j.libraries||[]).filter(l=>{
     const n=l.name||'';
-    if(n==='default'||n==='__offline__')return false;
+    if(n==='__offline__')return false;
     if(l.is_offline_storage===true)return false;
     return !!n;
   });

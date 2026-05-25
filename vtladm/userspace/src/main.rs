@@ -68,7 +68,11 @@ enum VtlError {
 }
 
 /// `cargo test` 用库名：可写入 DB，但**不出现在 Web 列表**且**不导出到 SCSI**（`lsscsi -g`）。
+#[cfg(test)]
 pub(crate) const LEGACY_DEFAULT_LIBRARY_NAME: &str = "default";
+/// Production builds must keep legacy `default` libraries visible for upgraded installs.
+#[cfg(not(test))]
+pub(crate) const LEGACY_DEFAULT_LIBRARY_NAME: &str = "__vtladm_cargo_test_default__";
 const DEFAULT_UNUSED_SHELF_NAME: &str = "unused";
 
 /// 系统保留库：模拟离库后的磁带保管区（仅有货架，无机械手槽位）。
@@ -5110,7 +5114,7 @@ fn export_tape(slot: i32, output: &str, checksum: bool) -> Result<(), VtlError> 
 fn list_libraries() -> Result<(), VtlError> {
     let conn = init_db()?;
     let mut stmt = conn.prepare("SELECT id, name, created_at FROM vtl_libraries ORDER BY name")?;
-    println!("Named virtual tape libraries (不含测试库 default):");
+    println!("Named virtual tape libraries:");
     for row in stmt.query_map([], |r| {
         Ok((
             r.get::<_, i64>(0)?,
