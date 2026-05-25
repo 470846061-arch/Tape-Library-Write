@@ -223,6 +223,17 @@ impl WebState {
         self.sessions.lock().unwrap().len()
     }
 
+    #[cfg(test)]
+    pub fn insert_test_session(&self, token: &str, user: &str, age_secs: u64) {
+        self.sessions.lock().unwrap().insert(
+            token.to_string(),
+            (
+                user.to_string(),
+                Instant::now() - Duration::from_secs(age_secs),
+            ),
+        );
+    }
+
     pub fn change_password(&self, old_p: &str, new_p: &str) -> Result<(), String> {
         if new_p.len() < 8 {
             return Err("新密码至少 8 个字符".into());
@@ -401,10 +412,15 @@ mod tests {
     #[test]
     fn test_web_auth_session_cap() {
         let st = fresh_state("session_cap");
-        for _ in 0..140 {
-            let _ = st.login(DEFAULT_WEB_USER, DEFAULT_WEB_PASSWORD).unwrap();
+        st.insert_test_session("oldest", DEFAULT_WEB_USER, 1_000);
+        for i in 1..MAX_SESSIONS {
+            st.insert_test_session(&format!("tok{i}"), DEFAULT_WEB_USER, 10);
         }
+        assert_eq!(st.session_count(), MAX_SESSIONS);
+        let tok = st.login(DEFAULT_WEB_USER, DEFAULT_WEB_PASSWORD).unwrap();
         assert!(st.session_count() <= 128);
+        assert!(st.session_username(Some("oldest")).is_none());
+        assert!(st.session_username(Some(tok.as_str())).is_some());
         let _ = fs::remove_file(&st.auth_file);
     }
 

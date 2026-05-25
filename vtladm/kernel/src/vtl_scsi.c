@@ -732,6 +732,7 @@ static int vtl_handle_read(struct scsi_cmnd *cmd, struct vtl_drive *drv, u8 op)
     u8 *buffer;
     u32 block_len;
     u32 blocks;
+    u32 actual;
     int ret;
 
     vtl_parse_rw_blocks(cdb, op, &blocks, &block_len, drv);
@@ -770,7 +771,6 @@ static int vtl_handle_write(struct scsi_cmnd *cmd, struct vtl_drive *drv, u8 op)
     u8 *buffer;
     u32 block_len;
     u32 blocks;
-    u32 actual;
     int ret;
 
     vtl_parse_rw_blocks(cdb, op, &blocks, &block_len, drv);

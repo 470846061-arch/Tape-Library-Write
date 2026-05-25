@@ -7282,6 +7282,7 @@ mod tests {
     fn test_import_rejects_overwriting_loaded_tape() {
         let dir = prepare_temp_vtl("import_loaded");
         let _ = create_named_library("default", 1, 2);
+        set_current_library("default");
         let _ = create_tape("loaded_import", 2 * 1024 * 1024, None).unwrap();
         let _ = assign_tape_to_slot("loaded_import", 0).unwrap();
         let _ = load_tape(0, 0).unwrap();
