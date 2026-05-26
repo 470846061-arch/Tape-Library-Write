@@ -3931,12 +3931,25 @@ pub(crate) fn run_web_ui(host: &str, port: u16) -> Result<(), super::VtlError> {
         super::VtlError::InvalidParameter(format!("Invalid web bind address {}:{}", host, port))
     })?;
 
+    // Cookie `Secure` 标志默认 OFF：
+    //   旧版自动检测策略 "非 loopback 绑定 → 开启 Secure" 是错的——绑 0.0.0.0 不代表客户端走 HTTPS。
+    //   开启 Secure 后，HTTP 访问会被浏览器静默丢弃 cookie，导致 "登录返回 200 但无法跳转/会话不持久"。
+    //   生产环境若前面有 HTTPS 反代，显式设置 VTLADM_WEB_COOKIE_SECURE=1 即可。
     if std::env::var("VTLADM_WEB_COOKIE_SECURE").is_err() {
-        let secure =
-            !(addr.ip().is_loopback() || addr.ip().is_unspecified() && host == "127.0.0.1");
-        std::env::set_var(
-            "VTLADM_WEB_COOKIE_SECURE_EFFECTIVE",
-            if secure { "1" } else { "0" },
+        std::env::set_var("VTLADM_WEB_COOKIE_SECURE_EFFECTIVE", "0");
+        eprintln!(
+            "VTL web cookie: Secure=off（HTTP 直连兼容）；如在 HTTPS 反代后部署，请设置 VTLADM_WEB_COOKIE_SECURE=1"
+        );
+    } else {
+        let on = matches!(
+            std::env::var("VTLADM_WEB_COOKIE_SECURE")
+                .unwrap_or_default()
+                .trim(),
+            "1" | "true" | "TRUE" | "yes" | "YES"
+        );
+        eprintln!(
+            "VTL web cookie: Secure={}（由 VTLADM_WEB_COOKIE_SECURE 显式指定）",
+            if on { "on" } else { "off" }
         );
     }
 
@@ -4399,14 +4412,36 @@ body.login-page{display:flex;min-height:100vh;align-items:center;justify-content
     }
   }
 
-  async function detectSetupTarget() {
+  // 登录成功后调用：检测会话 cookie 是否被浏览器接受。
+  // 返回 { ok:true, target } 或 { ok:false, reason }。
+  async function probeSessionAndPickTarget() {
+    var s;
     try {
-      var s = await fetch("/api/setup/status", { credentials: "include", cache: "no-store" });
-      if (!s.ok) return "/admin/library";
-      var sj = await s.json();
-      if (sj && sj.setup_required) return "/admin/setup-init";
-    } catch (_) { /* 忽略：跳到 library 作为默认 */ }
-    return "/admin/library";
+      s = await fetch("/api/setup/status", { credentials: "include", cache: "no-store" });
+    } catch (e) {
+      return { ok: false, reason: "网络错误：" + (e && e.message ? e.message : e) };
+    }
+    if (s.status === 401 || s.status === 403) {
+      // 服务端登录成功（已 Set-Cookie），但下一请求未携带 cookie——典型原因：
+      //  - 服务端 cookie 带 Secure 但当前用 HTTP（浏览器静默丢弃）
+      //  - 浏览器禁用了 cookie / 第三方 cookie 拦截
+      //  - 反代未透传 Set-Cookie / Cookie
+      return {
+        ok: false,
+        reason: "登录成功但浏览器未保留会话 cookie。常见原因：\n"
+          + "  1) 服务端启用了 Cookie Secure 但你用 HTTP 访问 → 在服务器 unset VTLADM_WEB_COOKIE_SECURE 或设为 0 后重启 vtladm-web；\n"
+          + "  2) 浏览器禁用了 cookie / 隐私模式拦截 → 允许此站点 cookie；\n"
+          + "  3) 反代未透传 Set-Cookie / Cookie 头 → 检查 nginx/traefik 配置。"
+      };
+    }
+    if (!s.ok) {
+      // 其他 5xx 不阻塞跳转
+      return { ok: true, target: "/admin/library" };
+    }
+    var sj = {};
+    try { sj = await s.json(); } catch (_) {}
+    var target = (sj && sj.setup_required) ? "/admin/setup-init" : "/admin/library";
+    return { ok: true, target: target };
   }
 
   async function doLogin() {
@@ -4443,9 +4478,15 @@ body.login-page{display:flex;min-height:100vh;align-items:center;justify-content
       try { body = await resp.json(); } catch (_) { /* 非 JSON 响应：保持 body={} */ }
 
       if (resp.ok && body && body.ok) {
-        setMsg("登录成功，正在跳转…", "ok");
-        var target = await detectSetupTarget();
-        window.location.assign(target);
+        setMsg("登录成功，校验会话…", "ok");
+        var probe = await probeSessionAndPickTarget();
+        if (!probe.ok) {
+          setMsg(probe.reason, "err");
+          await loadCaptcha();
+          return;
+        }
+        setMsg("会话已建立，跳转中…", "ok");
+        window.location.assign(probe.target);
         return;
       }
 
