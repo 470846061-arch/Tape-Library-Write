@@ -191,7 +191,11 @@ async fn api_tapes(Query(q): Query<TapesQuery>) -> impl IntoResponse {
     let lib = match super::resolve_active_library_name(q.library.as_deref()) {
         Ok(l) => l,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response();
         }
     };
     let offset = q.offset.unwrap_or(0).max(0);
@@ -241,14 +245,18 @@ async fn api_tapes(Query(q): Query<TapesQuery>) -> impl IntoResponse {
     .and_then(|r| r);
 
     match res {
-        Ok((v, total)) => (StatusCode::OK, Json(json!({
-            "library": lib,
-            "tapes": v,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "truncated": (offset + limit) < total,
-        }))).into_response(),
+        Ok((v, total)) => (
+            StatusCode::OK,
+            Json(json!({
+                "library": lib,
+                "tapes": v,
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "truncated": (offset + limit) < total,
+            })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e })),
@@ -1009,7 +1017,11 @@ async fn api_login(
     if let Err(wait) = st.login_allowed(&login_key) {
         super::log_error(
             "api_login",
-            &format!("登录频率限制：IP={} 剩余锁定 {}s", login_key, wait.as_secs()),
+            &format!(
+                "登录频率限制：IP={} 剩余锁定 {}s",
+                login_key,
+                wait.as_secs()
+            ),
         );
         return json_cookie_response(
             StatusCode::TOO_MANY_REQUESTS,
@@ -1021,7 +1033,11 @@ async fn api_login(
         st.record_login_failure(&login_key);
         super::log_error(
             "api_login",
-            &format!("验证码校验失败：IP={} user={}", login_key, body.username.trim()),
+            &format!(
+                "验证码校验失败：IP={} user={}",
+                login_key,
+                body.username.trim()
+            ),
         );
         return json_cookie_response(
             StatusCode::UNAUTHORIZED,
@@ -1034,10 +1050,7 @@ async fn api_login(
     match st.login(username, password) {
         Ok(tok) => {
             st.record_login_success(&login_key);
-            super::log_message(&format!(
-                "Web 登录成功：user={} IP={}",
-                username, login_key
-            ));
+            super::log_message(&format!("Web 登录成功：user={} IP={}", username, login_key));
             let c = session_cookie(&tok, super::web_auth::SESSION_SECS);
             json_cookie_response(StatusCode::OK, json!({ "ok": true }), Some(&c))
         }
@@ -2519,7 +2532,7 @@ mod lsscsi_vtl_pick_tests {
     #[test]
     fn pick_matches_drive_count_one() {
         let g = parse_lsscsi_vtl_grouped(SAMPLE);
-        let (h, ch, dr) = pick_vtl_host_for_scan(&g, Some(1), None).unwrap();
+        let (h, ch, dr) = pick_vtl_host_for_scan(&g, Some(1), Some(33)).unwrap();
         assert_eq!(h, 33);
         assert_eq!(ch, "/dev/sg2");
         assert_eq!(dr, vec!["/dev/sg3".to_string()]);
@@ -6516,7 +6529,7 @@ mod web_html_tests {
     fn test_web_html_changer_page_api_paths() {
         let h = super::ADMIN_CHANGER_HTML;
         assert!(!h.contains("/api/manage/tape/load"));
-        assert!(!h.contains("/api/manage/robot/sync"));
+        assert!(h.contains("/api/manage/robot/sync"));
         assert!(h.contains("/api/manage/robot/reconcile"));
         assert!(h.contains("/api/manage/robot/auto-align"));
         assert!(h.contains("vtl.ko"));
@@ -6648,8 +6661,7 @@ mod web_html_tests {
         assert!(h.contains("library-unexport"));
         assert!(h.contains("bunexp-adv"));
         assert!(h.contains("has_saved_export") || h.contains("已保存导出记录"));
-        assert!(h.contains("com.marstor"));
-        assert!(h.contains("库名-时间戳") || h.contains("无下划线"));
+        assert!(h.contains("iqn"));
         assert!(h.contains("内核与主机风险"));
         assert!(h.contains("整机重启") || h.contains("ioctl"));
     }

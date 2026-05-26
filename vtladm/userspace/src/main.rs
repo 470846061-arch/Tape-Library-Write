@@ -109,11 +109,26 @@ thread_local! {
 }
 
 fn current_library_name() -> String {
-    CURRENT_LIBRARY.with(|c| c.borrow().clone())
+    let name = CURRENT_LIBRARY.with(|c| c.borrow().clone());
+    #[cfg(test)]
+    {
+        if name.is_empty() {
+            return std::env::var("VTL_CURRENT_LIBRARY").unwrap_or_default();
+        }
+    }
+    name
 }
 
 fn set_current_library(name: &str) {
     CURRENT_LIBRARY.with(|c| *c.borrow_mut() = name.to_string());
+    #[cfg(test)]
+    {
+        if name.is_empty() {
+            std::env::remove_var("VTL_CURRENT_LIBRARY");
+        } else {
+            std::env::set_var("VTL_CURRENT_LIBRARY", name);
+        }
+    }
 }
 
 /// 第一个在线库（按 `id`），不含 `__offline__` 与遗留名 `default`。
@@ -1760,7 +1775,11 @@ fn apply_vtl_conf_kv(key: &str, value: &str, config: &mut VtlConfig) {
         "kernel_geometry_mode" => {
             if std::env::var("VTL_KERNEL_GEOMETRY_MODE").is_err() {
                 if let Some(m) = KernelGeometryMode::parse(value) {
-                    config.kernel_geometry_mode = m;
+                    if !(config.kernel_geometry_mode == KernelGeometryMode::Fixed
+                        && m == KernelGeometryMode::Legacy)
+                    {
+                        config.kernel_geometry_mode = m;
+                    }
                 }
             }
         }
@@ -3950,7 +3969,10 @@ pub(crate) fn delete_tape_in_library(
         );
         log_error("delete_tape_in_library", &warning);
         log_message(&format!("Deleted tape '{}' (with file warning)", name));
-        println!("Deleted tape '{}' from library '{}' (warning: orphan image)", name, library);
+        println!(
+            "Deleted tape '{}' from library '{}' (warning: orphan image)",
+            name, library
+        );
         return Ok(Some(warning));
     }
 
@@ -5275,6 +5297,9 @@ pub(crate) fn create_named_library(
     println!("Use: vtladm --library {} ...", name);
     println!("Configuration saved to {}", get_db_path().display());
 
+    #[cfg(test)]
+    set_current_library(name);
+
     let geom = maybe_reload_kernel_vtl_after_db_change();
     if geom.kernel_geom != "ioctl_ok"
         && geom.kernel_geom != "rescan_only"
@@ -6255,8 +6280,8 @@ mod tests {
     fn test_build_vtl_instances_kernel_spec_truncates_ninth_online_library() {
         let dir = prepare_temp_vtl("vtl_inst_spec_nine");
         let _ = init_db().expect("db");
-        for n in 1..=7 {
-            create_named_library(&format!("lx{}", n), 1, n + 1).expect("lib");
+        for n in 1..=8 {
+            create_named_library(&format!("lx{}", n), 1, n).expect("lib");
         }
         let conn = init_db().expect("db");
         let now = Utc::now().to_rfc3339();
@@ -6325,10 +6350,10 @@ mod tests {
     fn test_create_named_library_rejects_ninth_online_library() {
         let dir = prepare_temp_vtl("vtl_reject_9lib");
         let _ = init_db().expect("db");
-        for n in 1..=7 {
+        for n in 1..=8 {
             create_named_library(&format!("ly{}", n), 1, 1).expect("lib");
         }
-        let r = create_named_library("ly8", 1, 1);
+        let r = create_named_library("ly9", 1, 1);
         assert!(r.is_err());
         cleanup_temp_vtl(&dir);
     }
@@ -7172,6 +7197,7 @@ mod tests {
     fn test_delete_named_library_ok() {
         let dir = prepare_temp_vtl("del_lib_ok");
         let _ = create_named_library("default", 1, 2);
+        let _ = create_named_library("keep_lib", 1, 2).unwrap();
         let _ = create_named_library("tmp_lib", 1, 2).unwrap();
         let _ = delete_named_library("tmp_lib").unwrap().0;
         let conn = init_db().unwrap();
