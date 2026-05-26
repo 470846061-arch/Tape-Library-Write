@@ -365,6 +365,7 @@ static void vtl_quiesce_all_hosts(bool for_module_exit)
             continue;
         scsi_remove_host(vhost->shost);
         vhost->scsi_registered = false;
+        down_write(&vhost->io_sem);
         ch = vhost->changer;
         vhost->changer = NULL;
         smp_wmb();
@@ -372,6 +373,7 @@ static void vtl_quiesce_all_hosts(bool for_module_exit)
             vtl_changer_clear_media(ch);
             vtl_changer_free(ch);
         }
+        up_write(&vhost->io_sem);
     }
     mutex_unlock(&vtl_list_lock);
 
@@ -1151,6 +1153,7 @@ static int vtl_probe(struct platform_device *pdev)
     vhost->pdev = pdev;
     vhost->scsi_registered = false;
     vhost->scan_done = false;
+    init_rwsem(&vhost->io_sem);
 
     changer = vtl_changer_alloc(pdev->id, nd, ns);
     if (!changer) {
@@ -1222,18 +1225,20 @@ static int vtl_remove(struct platform_device *pdev)
     mutex_unlock(&vtl_list_lock);
 
     shost = vhost->shost;
-    changer = vhost->changer;
-    vhost->changer = NULL;
-    smp_wmb();
-
     if (vhost->scsi_registered && shost) {
         scsi_remove_host(shost);
         vhost->scsi_registered = false;
     }
+
+    down_write(&vhost->io_sem);
+    changer = vhost->changer;
+    vhost->changer = NULL;
+    smp_wmb();
     if (changer) {
         vtl_changer_clear_media(changer);
         vtl_changer_free(changer);
     }
+    up_write(&vhost->io_sem);
     if (shost)
         scsi_host_put(shost);
 

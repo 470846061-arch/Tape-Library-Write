@@ -646,30 +646,48 @@ static int vtl_handle_mode_select(struct scsi_cmnd *cmd, struct vtl_host *vhost)
     return SAM_STAT_GOOD;
 }
 
+static u32 vtl_get_u24(const u8 *p);
+
 static void vtl_parse_rw_blocks(const u8 *cdb, u8 op, u32 *blocks, u32 *block_len,
-                                  struct vtl_drive *drv)
+                                struct vtl_drive *drv)
 {
+    bool fixed;
+    u32 transfer_len;
+
     *block_len = drv->block_size;
     *blocks = 0;
 
     switch (op) {
     case READ_6:
     case WRITE_6:
-        *blocks = ((u32)cdb[2] << 16) | ((u32)cdb[3] << 8) | (u32)cdb[4];
+        fixed = (cdb[1] & 0x01) != 0;
+        transfer_len = vtl_get_u24(&cdb[2]);
+        if (fixed) {
+            *blocks = transfer_len;
+        } else {
+            *block_len = transfer_len;
+            *blocks = 1;
+        }
         break;
     case READ_10:
     case WRITE_10:
-        *blocks = (cdb[7] << 8) | cdb[8];
-        if (cdb[1] & 0x02) {
-            *block_len = (cdb[6] << 16) | (cdb[7] << 8) | cdb[8];
+        fixed = (cdb[1] & 0x02) != 0;
+        transfer_len = vtl_get_u24(&cdb[6]);
+        if (fixed) {
+            *blocks = transfer_len;
+        } else {
+            *block_len = transfer_len;
             *blocks = 1;
         }
         break;
     case READ_12:
     case WRITE_12:
-        *blocks = vtl_get_be32(&cdb[6]);
-        if (cdb[1] & 0x02) {
-            *block_len = vtl_get_be32(&cdb[6]);
+        fixed = (cdb[1] & 0x02) != 0;
+        transfer_len = vtl_get_be32(&cdb[6]);
+        if (fixed) {
+            *blocks = transfer_len;
+        } else {
+            *block_len = transfer_len;
             *blocks = 1;
         }
         break;
@@ -823,12 +841,19 @@ static int vtl_handle_space(struct scsi_cmnd *cmd, struct vtl_drive *drv)
 {
     u8 *cdb = cmd->cmnd;
     int code, count;
+    int ret;
 
     code = cdb[1] & 7;
     count = vtl_get_s24(&cdb[2]);
 
-    if (vtl_tape_space(drv, code, count) == -ENODEV) {
+    ret = vtl_tape_space(drv, code, count);
+    if (ret == -ENODEV) {
         vtl_set_sense(&drv->sense, NOT_READY, 0x3a, 0);
+        vtl_build_sense_buffer(cmd, &drv->sense);
+        return SAM_STAT_CHECK_CONDITION;
+    }
+    if (ret < 0) {
+        vtl_set_sense(&drv->sense, ILLEGAL_REQUEST, 0x24, 0);
         vtl_build_sense_buffer(cmd, &drv->sense);
         return SAM_STAT_CHECK_CONDITION;
     }
@@ -1315,7 +1340,15 @@ int vtl_scsi_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
     struct vtl_changer *ch;
     int result;
 
+    if (vtl_reconfig_in_progress()) {
+        cmd->result = (DID_NO_CONNECT << 16);
+        vtl_scsi_done(cmd);
+        return 0;
+    }
+
+    down_read(&vhost->io_sem);
     if (vtl_reconfig_in_progress() || !vhost->changer) {
+        up_read(&vhost->io_sem);
         cmd->result = (DID_NO_CONNECT << 16);
         vtl_scsi_done(cmd);
         return 0;
@@ -1325,6 +1358,7 @@ int vtl_scsi_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 
     /* Only virtual target 0 / channel 0 is implemented */
     if (cmd->device->channel != 0 || cmd->device->id != 0) {
+        up_read(&vhost->io_sem);
         cmd->result = (DID_BAD_TARGET << 16);
         vtl_scsi_done(cmd);
         return 0;
@@ -1342,6 +1376,7 @@ int vtl_scsi_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 
 out:
     vtl_set_cmd_result(cmd, result);
+    up_read(&vhost->io_sem);
     vtl_scsi_done(cmd);
 
     return 0;

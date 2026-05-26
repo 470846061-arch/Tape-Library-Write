@@ -1,3 +1,8 @@
+// 测试模式下 `maybe_reload_kernel_vtl_after_db_change` 走 `#[cfg(test)]` 短路（避免触碰 /dev/vtl
+// 引发并发 ioctl 内核 panic），导致其下游的内核交互辅助函数在 test 编译中均成为死代码。
+// 这些函数在生产构建中正常使用——抑制 test 模式专属的 dead_code 噪声。
+#![cfg_attr(test, allow(dead_code))]
+
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -2066,12 +2071,14 @@ fn ioctl_error_benign(e: &std::io::Error) -> bool {
 ///
 /// **`VTL_SKIP_KERNEL_RELOAD=1`**: skip ioctl, script, and unchanged-spec rescan for this process.
 /// See `docs/SCSI.md` §1c / §1e / §1f.
+#[cfg(test)]
 pub(crate) fn maybe_reload_kernel_vtl_after_db_change() -> KernelGeomSync {
     // 测试环境绝不能触碰真实内核模块：并发 ioctl SET_INSTANCES 会导致 panic / 整机重启。
-    #[cfg(test)]
-    {
-        return KernelGeomSync::status("skipped", "cfg(test)");
-    }
+    KernelGeomSync::status("skipped", "cfg(test)")
+}
+
+#[cfg(not(test))]
+pub(crate) fn maybe_reload_kernel_vtl_after_db_change() -> KernelGeomSync {
     if std::env::var("VTL_SKIP_KERNEL_RELOAD").ok().as_deref() == Some("1") {
         log_message("kernel_vtl_reload_script: skipped (VTL_SKIP_KERNEL_RELOAD=1)");
         return KernelGeomSync::status("skipped", "VTL_SKIP_KERNEL_RELOAD=1");

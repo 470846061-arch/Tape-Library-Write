@@ -3,6 +3,7 @@
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/file.h>
+#include <linux/limits.h>
 
 static struct vtl_tape *vtl_tapes[VTL_MAX_SLOTS];
 static DEFINE_MUTEX(vtl_tape_lock);
@@ -509,6 +510,9 @@ int vtl_tape_space(struct vtl_drive *drv, int code, int count)
 {
     struct vtl_tape *tape;
     loff_t delta;
+    loff_t new_pos;
+    s64 max_blocks;
+    int ret = 0;
 
     mutex_lock(&drv->lock);
     tape = drv->loaded_tape;
@@ -521,8 +525,23 @@ int vtl_tape_space(struct vtl_drive *drv, int code, int count)
 
     switch (code) {
     case 0:
-        delta = (loff_t)count * (loff_t)drv->block_size;
-        tape->position += delta;
+        if (drv->block_size == 0) {
+            ret = -EINVAL;
+            break;
+        }
+        max_blocks = S64_MAX / (s64)drv->block_size;
+        if ((s64)count > max_blocks || (s64)count < -max_blocks) {
+            ret = -EINVAL;
+            break;
+        }
+        delta = (loff_t)((s64)count * (s64)drv->block_size);
+        if ((delta > 0 && tape->position > S64_MAX - delta) ||
+            (delta < 0 && tape->position < S64_MIN - delta)) {
+            ret = -EINVAL;
+            break;
+        }
+        new_pos = tape->position + delta;
+        tape->position = new_pos;
         break;
     case 1:
         drv->at_filemark = (count != 0);
@@ -538,7 +557,14 @@ int vtl_tape_space(struct vtl_drive *drv, int code, int count)
         drv->at_filemark = true;
         break;
     default:
+        ret = -EINVAL;
         break;
+    }
+
+    if (ret) {
+        mutex_unlock(&tape->lock);
+        mutex_unlock(&drv->lock);
+        return ret;
     }
 
     if (tape->position < 0)

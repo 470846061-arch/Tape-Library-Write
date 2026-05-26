@@ -7,6 +7,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
+#include <linux/rwsem.h>
 #include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/workqueue.h>
@@ -157,6 +158,12 @@ struct vtl_changer {
 struct vtl_host {
     struct Scsi_Host *shost;
     struct vtl_changer *changer;
+    /*
+     * Protects changer and its embedded drives while queuecommand executes.
+     * Hot reconfiguration/removal takes the write side before publishing NULL
+     * and freeing the old changer.
+     */
+    struct rw_semaphore io_sem;
     struct list_head list;
     /** Back-pointer for deferred scsi_add_host (outside probe). */
     struct platform_device *pdev;
