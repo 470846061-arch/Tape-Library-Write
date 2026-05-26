@@ -137,12 +137,39 @@ impl WebState {
     }
 
     pub fn login(&self, user: &str, pass: &str) -> Result<String, LoginFail> {
-        let cred = self.read_auth().map_err(|_| LoginFail::AuthFile)?;
+        let cred = self.read_auth().map_err(|e| {
+            eprintln!(
+                "[web_auth] login: 读取认证文件失败: {} (path={})",
+                e,
+                self.auth_file.display()
+            );
+            LoginFail::AuthFile
+        })?;
         if user != cred.username {
+            eprintln!(
+                "[web_auth] login: 用户名不匹配: input={:?} expected={:?}",
+                user, cred.username
+            );
             return Err(LoginFail::BadCredentials);
         }
-        if !verify(pass, &cred.password_hash).unwrap_or(false) {
-            return Err(LoginFail::BadCredentials);
+        match verify(pass, &cred.password_hash) {
+            Ok(true) => { /* 密码正确，继续 */ }
+            Ok(false) => {
+                eprintln!(
+                    "[web_auth] login: bcrypt verify 返回 false（密码不匹配），pass_len={} hash_prefix={}",
+                    pass.len(),
+                    &cred.password_hash[..cred.password_hash.len().min(20)]
+                );
+                return Err(LoginFail::BadCredentials);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[web_auth] login: bcrypt verify 返回 Err: {} hash_prefix={}",
+                    e,
+                    &cred.password_hash[..cred.password_hash.len().min(20)]
+                );
+                return Err(LoginFail::BadCredentials);
+            }
         }
         let tok = Uuid::new_v4().to_string();
         let mut sess = self.sessions.lock().unwrap();
