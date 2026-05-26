@@ -137,36 +137,23 @@ impl WebState {
     }
 
     pub fn login(&self, user: &str, pass: &str) -> Result<String, LoginFail> {
-        let cred = self.read_auth().map_err(|e| {
-            eprintln!(
-                "[web_auth] login: 读取认证文件失败: {} (path={})",
-                e,
-                self.auth_file.display()
-            );
-            LoginFail::AuthFile
-        })?;
+        let cred = self.read_auth().map_err(|_| LoginFail::AuthFile)?;
         if user != cred.username {
-            eprintln!(
-                "[web_auth] login: 用户名不匹配: input={:?} expected={:?}",
-                user, cred.username
-            );
             return Err(LoginFail::BadCredentials);
         }
         match verify(pass, &cred.password_hash) {
             Ok(true) => { /* 密码正确，继续 */ }
-            Ok(false) => {
-                eprintln!(
-                    "[web_auth] login: bcrypt verify 返回 false（密码不匹配），pass_len={} hash_prefix={}",
-                    pass.len(),
-                    &cred.password_hash[..cred.password_hash.len().min(20)]
-                );
-                return Err(LoginFail::BadCredentials);
-            }
+            Ok(false) => return Err(LoginFail::BadCredentials),
             Err(e) => {
-                eprintln!(
-                    "[web_auth] login: bcrypt verify 返回 Err: {} hash_prefix={}",
-                    e,
-                    &cred.password_hash[..cred.password_hash.len().min(20)]
+                // bcrypt 解析哈希失败属于罕见异常（认证文件被破坏 / 哈希被改坏）。
+                // 写入错误日志便于运维定位，但不向上层暴露细节。
+                super::log_error(
+                    "web_auth::login",
+                    &format!(
+                        "bcrypt verify 异常: {} (path={}, 建议: vtladm reset-web-auth)",
+                        e,
+                        self.auth_file.display()
+                    ),
                 );
                 return Err(LoginFail::BadCredentials);
             }

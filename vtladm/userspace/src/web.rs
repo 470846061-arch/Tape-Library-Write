@@ -1046,7 +1046,9 @@ async fn api_login(
         );
     }
     let username = body.username.trim();
-    let password = body.password.trim();
+    // 密码不 trim：与 web_auth::change_password 一致；保留前后空格的合法密码字符。
+    // 旧版 .trim() 会让 "mypass " 被改成 "mypass"，与 bcrypt 写入路径不一致导致永远登录失败。
+    let password = body.password.as_str();
     match st.login(username, password) {
         Ok(tok) => {
             st.record_login_success(&login_key);
@@ -4278,12 +4280,23 @@ document.getElementById('sf').onsubmit=async(ev)=>{
 "#
 );
 
+// 登录页：**不使用 <form>**。
+//
+// 历史 bug：旧版用 <form id="f"> 但未设 action，靠 onsubmit 里的 ev.preventDefault()
+// 阻止默认提交。一旦 JS 因任何原因（绑定时机、autofill 提前提交、双击、CSP）
+// 没拦截住，浏览器就把表单按默认行为 POST 到当前 URL `/login`——而 `/login`
+// 是 GET 路由，结果是渲染同一个登录页，用户看到的就是"只刷新就结束"。
+//
+// 重写方案：完全用 <div> 容器 + <button type="button">，物理上消除"默认表单提交"
+// 这条故障路径。所有交互都走显式 addEventListener；fetch 失败、网络异常、JSON 解析
+// 失败均有可见错误提示，不会静默回退。
 const LOGIN_HTML: &str = concat!(
     r#"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="referrer" content="no-referrer"/>
 <title>VTL 登录</title>
 <style>
 "#,
@@ -4294,59 +4307,188 @@ body.login-page{display:flex;min-height:100vh;align-items:center;justify-content
 .login-card h1{margin:0 0 .5rem;font-size:1.2rem;color:var(--accent);}
 .login-hint{font-size:.84rem;color:var(--muted);line-height:1.55;margin:0 0 1rem;}
 .login-hint code{font-size:.8rem;background:#f1f5f9;padding:.1rem .35rem;border-radius:4px;border:1px solid #e2e8f0;}
-.login-card label{display:block;margin:.5rem 0 .2rem;}
-.login-card input[type=text],.login-card input[type=password],.login-card input[inputmode=numeric]{width:100%;box-sizing:border-box;}
-.login-card button[type=submit]{margin-top:1rem;width:100%;padding:.55rem;font-weight:600;}
-.login-card .err{margin:.5rem 0 0;}
-.login-card a{color:var(--accent);}
+.login-card label{display:block;margin:.6rem 0 .2rem;font-size:.92rem;}
+.login-card input{width:100%;box-sizing:border-box;padding:.45rem .55rem;font-size:.95rem;}
+.login-card .captcha-row{display:flex;align-items:center;gap:.6rem;}
+.login-card .captcha-q{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:1rem;letter-spacing:.05em;}
+.login-card .btn-link{background:none;border:none;color:var(--accent);cursor:pointer;font-size:.84rem;padding:0;text-decoration:underline;}
+.login-card .btn-link:disabled{color:var(--muted);cursor:wait;text-decoration:none;}
+.login-card #submitBtn{margin-top:1.1rem;width:100%;padding:.6rem;font-weight:600;font-size:.98rem;cursor:pointer;}
+.login-card #submitBtn:disabled{opacity:.65;cursor:wait;}
+.login-card #msg{margin:.7rem 0 0;font-size:.88rem;min-height:1.2em;line-height:1.45;word-break:break-word;}
+.login-card #msg.err{color:#b91c1c;}
+.login-card #msg.ok{color:#047857;}
+.login-card .login-foot{margin:.85rem 0 0;font-size:.84rem;color:var(--muted);}
+.login-card .login-foot a{color:var(--accent);}
 </style>
 </head>
 <body class="login-page">
-<div class="login-card">
-<h1>Web 登录</h1>
-<p class="login-hint">默认用户 <code>admin</code>。首次运行会在日志目录生成 <code>web_admin.json</code>（bcrypt 哈希）；初始密码请从安装输出或服务器端重置命令获取，并在登录后尽快修改。</p>
-<form id="f">
-<label>用户名</label><input name="u" type="text" autocomplete="username" required/>
-<label>密码</label><input name="p" type="password" autocomplete="current-password" required/>
-<label>验证码 <span id="q"></span></label><input name="a" type="text" inputmode="numeric" required/>
-<input type="hidden" name="cid"/>
-<button type="submit">登录</button>
-<p class="err" id="e"></p>
-<p style="margin:.75rem 0 0;font-size:.86rem"><a href="/">进入首页</a>（须先登录）。</p>
-</form>
+<div class="login-card" id="loginCard">
+  <h1>VTL Web 登录</h1>
+  <p class="login-hint">默认用户 <code>admin</code>。首次运行会在日志目录生成 <code>web_admin.json</code>（bcrypt 哈希）；初始密码请从安装输出或服务器端 <code>vtladm reset-web-auth</code> 获取，登录后请尽快修改。</p>
+
+  <label for="u">用户名</label>
+  <input id="u" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required/>
+
+  <label for="p">密码</label>
+  <input id="p" type="password" autocomplete="current-password" required/>
+
+  <label for="a">验证码</label>
+  <div class="captcha-row">
+    <span id="q" class="captcha-q">加载中…</span>
+    <button id="captchaReload" type="button" class="btn-link" title="换一题">换一题</button>
+  </div>
+  <input id="a" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" required/>
+
+  <button id="submitBtn" type="button">登录</button>
+
+  <p id="msg" role="status" aria-live="polite"></p>
+  <p class="login-foot"><a href="/">返回首页</a>（须先登录后访问）。</p>
 </div>
+
 <script>
-async function cap(){
-  const r=await fetch('/api/captcha');
-  const j=await r.json();
-  document.getElementById('q').textContent=j.question||'';
-  document.querySelector('[name=cid]').value=j.captcha_id||'';
-}
-cap();
-document.getElementById('f').onsubmit=async(ev)=>{
-  ev.preventDefault();
-  document.getElementById('e').textContent='';
-  const fd=new FormData(ev.target);
-  const body={
-    username:fd.get('u'),
-    password:fd.get('p'),
-    captcha_id:fd.get('cid'),
-    captcha_answer:fd.get('a')
-  };
-  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'include'});
-  const j=await r.json().catch(()=>({}));
-  if(r.ok){
-    try{
-      const s=await fetch('/api/setup/status',{credentials:'include'});
-      const sj=await s.json().catch(()=>({}));
-      if(sj.setup_required){location.href='/admin/setup-init';return;}
-    }catch(_){}
-    location.href='/admin/library';
-    return;
+(function () {
+  "use strict";
+
+  var state = { captchaId: "", busy: false };
+
+  function $(id) { return document.getElementById(id); }
+
+  function setMsg(text, kind) {
+    var el = $("msg");
+    if (!el) return;
+    el.textContent = text || "";
+    el.className = kind || "";
   }
-  document.getElementById('e').textContent=j.error||r.status;
-  cap();
-};
+
+  function setBusy(b) {
+    state.busy = b;
+    var btn = $("submitBtn");
+    if (btn) {
+      btn.disabled = b;
+      btn.textContent = b ? "登录中…" : "登录";
+    }
+    var rl = $("captchaReload");
+    if (rl) rl.disabled = b;
+  }
+
+  function getInput(id) {
+    var el = $(id);
+    return el ? String(el.value || "") : "";
+  }
+
+  async function loadCaptcha() {
+    var q = $("q");
+    var rl = $("captchaReload");
+    if (q) q.textContent = "加载中…";
+    if (rl) rl.disabled = true;
+    state.captchaId = "";
+    try {
+      var r = await fetch("/api/captcha", { credentials: "include", cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      var j = await r.json();
+      state.captchaId = j.captcha_id || "";
+      if (q) q.textContent = (j.question || "(空)").trim();
+      var ans = $("a");
+      if (ans) ans.value = "";
+    } catch (e) {
+      if (q) q.textContent = "加载失败";
+      setMsg("无法获取验证码：" + (e && e.message ? e.message : e) + "（请检查与服务器的连接，然后点「换一题」）", "err");
+    } finally {
+      if (rl && !state.busy) rl.disabled = false;
+    }
+  }
+
+  async function detectSetupTarget() {
+    try {
+      var s = await fetch("/api/setup/status", { credentials: "include", cache: "no-store" });
+      if (!s.ok) return "/admin/library";
+      var sj = await s.json();
+      if (sj && sj.setup_required) return "/admin/setup-init";
+    } catch (_) { /* 忽略：跳到 library 作为默认 */ }
+    return "/admin/library";
+  }
+
+  async function doLogin() {
+    if (state.busy) return;
+    setMsg("", "");
+    var u = getInput("u").trim();
+    var p = getInput("p");          // 密码不 trim：保留前后空格的合法字符
+    var a = getInput("a").trim();
+    if (!u || !p || !a) { setMsg("请填写用户名、密码和验证码", "err"); return; }
+    if (!state.captchaId) { setMsg("验证码未加载完成，请稍候或点「换一题」", "err"); return; }
+
+    setBusy(true);
+    try {
+      var resp;
+      try {
+        resp = await fetch("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          body: JSON.stringify({
+            username: u,
+            password: p,
+            captcha_id: state.captchaId,
+            captcha_answer: a
+          }),
+          credentials: "include",
+          cache: "no-store"
+        });
+      } catch (netErr) {
+        setMsg("网络错误：无法连接服务器（" + (netErr && netErr.message ? netErr.message : netErr) + "）", "err");
+        return;
+      }
+
+      var body = {};
+      try { body = await resp.json(); } catch (_) { /* 非 JSON 响应：保持 body={} */ }
+
+      if (resp.ok && body && body.ok) {
+        setMsg("登录成功，正在跳转…", "ok");
+        var target = await detectSetupTarget();
+        window.location.assign(target);
+        return;
+      }
+
+      var msg = (body && body.error) ? body.error : ("登录失败（HTTP " + resp.status + "）");
+      if (body && body.hint) msg += " — " + body.hint;
+      if (body && typeof body.retry_after_secs === "number") {
+        msg += "（约 " + body.retry_after_secs + " 秒后可重试）";
+      }
+      setMsg(msg, "err");
+      // 验证码单次消费，无论成败都换一题
+      await loadCaptcha();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function onKey(ev) {
+    if (ev.key === "Enter" || ev.keyCode === 13) {
+      ev.preventDefault();
+      doLogin();
+    }
+  }
+
+  function init() {
+    var btn = $("submitBtn");
+    if (btn) btn.addEventListener("click", function (ev) { ev.preventDefault(); doLogin(); });
+    var rl = $("captchaReload");
+    if (rl) rl.addEventListener("click", function (ev) { ev.preventDefault(); loadCaptcha(); });
+    ["u", "p", "a"].forEach(function (id) {
+      var el = $(id);
+      if (el) el.addEventListener("keydown", onKey);
+    });
+    var first = $("u");
+    if (first) { try { first.focus(); } catch (_) {} }
+    loadCaptcha();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
 </script>
 </body>
 </html>
