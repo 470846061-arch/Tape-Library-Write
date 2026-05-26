@@ -27,6 +27,18 @@ struct LibraryQuery {
     library: Option<String>,
 }
 
+/// `/api/tapes` 支持分页。
+#[derive(serde::Deserialize)]
+struct TapesQuery {
+    library: Option<String>,
+    /// 起始偏移量（默认 0）。
+    #[serde(default)]
+    offset: Option<i64>,
+    /// 每页条数上限（默认 5000，最大 50000）。
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
 /// `GET /api/manage/iscsi/library-export-defaults`：可选 `regenerate=1` 忽略库内已存记录并生成新 IQN。
 #[derive(serde::Deserialize)]
 struct IscsiExportDefaultsQuery {
@@ -44,6 +56,26 @@ struct TransportScanQuery {
     /// `local` | `iscsi` | `fc` — 仅影响响应中的 `transport_hint` 文案。
     #[serde(default)]
     transport: Option<String>,
+}
+
+/// RAII guard：在 `spawn_blocking` 中安全地临时切换 `CURRENT_LIBRARY`。
+/// Drop 时自动恢复原值，即使闭包 panic / 提前 `?` 返回也不会泄漏。
+struct LibraryGuard {
+    prev: String,
+}
+
+impl LibraryGuard {
+    fn new(lib: &str) -> Self {
+        let prev = super::current_library_name();
+        super::set_current_library(lib);
+        LibraryGuard { prev }
+    }
+}
+
+impl Drop for LibraryGuard {
+    fn drop(&mut self) {
+        super::set_current_library(&self.prev);
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -155,29 +187,38 @@ async fn api_libraries() -> impl IntoResponse {
     }
 }
 
-async fn api_tapes(Query(q): Query<LibraryQuery>) -> impl IntoResponse {
-    let lib = match resolve_library_from_query(&q) {
+async fn api_tapes(Query(q): Query<TapesQuery>) -> impl IntoResponse {
+    let lib = match super::resolve_active_library_name(q.library.as_deref()) {
         Ok(l) => l,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response();
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response();
         }
     };
+    let offset = q.offset.unwrap_or(0).max(0);
+    let limit = q.limit.unwrap_or(5000).clamp(1, 50000);
     let lib_for_db = lib.clone();
-    let res: Result<Vec<TapeRow>, String> = tokio::task::spawn_blocking(move || {
+    let res: Result<(Vec<TapeRow>, i64), String> = tokio::task::spawn_blocking(move || {
         let conn = super::init_db().map_err(|e| e.to_string())?;
         let library_id =
             super::resolve_library_id(&conn, &lib_for_db).map_err(|e| e.to_string())?;
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tapes WHERE library_id = ?1",
+                rusqlite::params![library_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
                 "SELECT t.name, t.barcode, t.capacity_bytes, t.used_bytes, t.slot, sh.name,
                  EXISTS(SELECT 1 FROM drives d WHERE d.library_id = t.library_id AND d.tape_id = t.id)
                  FROM tapes t
                  LEFT JOIN shelves sh ON t.shelf_id = sh.id
-                 WHERE t.library_id = ?1 ORDER BY t.name",
+                 WHERE t.library_id = ?1 ORDER BY t.name LIMIT ?2 OFFSET ?3",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(rusqlite::params![library_id], |r| {
+            .query_map(rusqlite::params![library_id, limit, offset], |r| {
                 Ok(TapeRow {
                     name: r.get(0)?,
                     barcode: r.get(1)?,
@@ -193,14 +234,21 @@ async fn api_tapes(Query(q): Query<LibraryQuery>) -> impl IntoResponse {
         for row in rows {
             v.push(row.map_err(|e| e.to_string())?);
         }
-        Ok(v)
+        Ok((v, total))
     })
     .await
     .map_err(|e| e.to_string())
     .and_then(|r| r);
 
     match res {
-        Ok(v) => (StatusCode::OK, Json(json!({ "library": lib, "tapes": v }))).into_response(),
+        Ok((v, total)) => (StatusCode::OK, Json(json!({
+            "library": lib,
+            "tapes": v,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "truncated": (offset + limit) < total,
+        }))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e })),
@@ -1135,11 +1183,8 @@ async fn api_manage_tape_create(
     let shelf = body.shelf.clone();
     let res = tokio::task::spawn_blocking(move || {
         let size = super::parse_size(&size_s).map_err(|e| e.to_string())?;
-        let prev = super::current_library_name();
-        super::set_current_library(&lib);
-        let r = super::create_tape(&name, size, shelf.as_deref());
-        super::set_current_library(&prev);
-        r.map_err(|e| e.to_string())
+        let _guard = LibraryGuard::new(&lib);
+        super::create_tape(&name, size, shelf.as_deref()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())
@@ -1280,7 +1325,13 @@ async fn api_manage_tape_delete(
     .and_then(|r| r);
 
     match res {
-        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
+        Ok(warning) => {
+            let mut resp = json!({ "ok": true });
+            if let Some(w) = warning {
+                resp["warning"] = json!(w);
+            }
+            (StatusCode::OK, Json(resp)).into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
 }
@@ -1331,11 +1382,8 @@ async fn api_manage_shelf_create(
     let lib = body.library.clone();
     let name = body.name.clone();
     let res = tokio::task::spawn_blocking(move || {
-        let prev = super::current_library_name();
-        super::set_current_library(&lib);
-        let r = super::create_shelf(&name);
-        super::set_current_library(&prev);
-        r.map_err(|e| e.to_string())
+        let _guard = LibraryGuard::new(&lib);
+        super::create_shelf(&name).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())
@@ -1623,11 +1671,8 @@ async fn api_manage_shelf_place(
     let tape = body.tape.clone();
     let shelf = body.shelf.clone();
     let res = tokio::task::spawn_blocking(move || {
-        let prev = super::current_library_name();
-        super::set_current_library(&lib);
-        let r = super::shelf_place_tape(&tape, shelf.as_deref());
-        super::set_current_library(&prev);
-        r.map_err(|e| e.to_string())
+        let _guard = LibraryGuard::new(&lib);
+        super::shelf_place_tape(&tape, shelf.as_deref()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())
@@ -3969,6 +4014,7 @@ function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':
 function loc(x){
   if(x.in_drive)return'驱动器';
   if(x.slot!=null)return'槽位 '+x.slot;
+  if(x.shelf_name)return'架: '+escapeHtml(x.shelf_name);
   return'货架';
 }
 async function loadLibs(){
@@ -3977,7 +4023,7 @@ async function loadLibs(){
   if(!r.ok){document.getElementById('tapes').innerHTML='<p class="err">'+(j.error||r.status)+'</p>';return;}
   const sel=document.getElementById('lib');
   sel.innerHTML='';
-  (j.libraries||[]).filter(l=>!l.is_offline_storage).forEach(l=>{const o=document.createElement('option');o.value=l.name;o.textContent=l.name+' (#'+l.id+')';sel.appendChild(o);});
+  (j.libraries||[]).filter(l=>!l.is_offline_storage&&l.name).forEach(l=>{const o=document.createElement('option');o.value=l.name;o.textContent=l.name+' (#'+l.id+')';sel.appendChild(o);});
   if(sel.options.length) await refresh();
 }
 async function refresh(){
@@ -3989,6 +4035,7 @@ async function refresh(){
   if(!rows.length){document.getElementById('tapes').innerHTML='<div class="empty">当前库暂无磁带</div>';return;}
   let h='<table class="data-table"><thead><tr><th>名称</th><th>条码</th><th class="num">容量</th><th class="num">已用</th><th>位置</th><th>货架</th><th>在驱动</th></tr></thead><tbody>';
   rows.forEach(x=>{h+='<tr><td>'+escapeHtml(x.name)+'</td><td>'+escapeHtml(x.barcode)+'</td><td class="num">'+fmtBytes(x.capacity_bytes)+'</td><td class="num">'+fmtBytes(x.used_bytes||0)+'</td><td>'+loc(x)+'</td><td>'+(x.shelf_name?escapeHtml(x.shelf_name):'—')+'</td><td>'+(x.in_drive?'是':'否')+'</td></tr>';});
+  if(tj.truncated){h+='<tr><td colspan="7" style="text-align:center;color:#888">（已显示前 '+rows.length+' 条，共 '+tj.total+' 条）</td></tr>';}
   h+='</tbody></table>';document.getElementById('tapes').innerHTML=h;
 }
 document.getElementById('reload').onclick=refresh;
@@ -4511,6 +4558,10 @@ const ADMIN_TAPES_HTML: &str = concat!(
     include_str!("web_shell.css"),
     r#"
 input,select{max-width:36rem;}
+.btn-del{color:#c0392b!important;font-weight:600;}
+.btn-del:hover{background:#c0392b;color:#fff!important;}
+.btn-init{color:#2980b9!important;}
+.loading-mask{pointer-events:none;opacity:.5;}
 </style>
 </head>
 <body><div class="app">
@@ -4631,8 +4682,9 @@ async function loadTapeMaintainTable(){
   rows.forEach(t=>{
     const loc=t.in_drive?'驱动中':(t.slot!=null?('槽位 '+t.slot):('架: '+(t.shelf_name?escapeHtml(t.shelf_name):'—')));
     const enc=encodeURIComponent(t.name);
-    h+='<tr><td>'+escapeHtml(t.name)+'</td><td>'+escapeHtml(t.barcode)+'</td><td class="num">'+fmtBytes(t.capacity_bytes)+'</td><td class="num">'+fmtBytes(t.used_bytes||0)+'</td><td>'+loc+'</td><td class="ops"><button type="button" class="lnk btn-init" data-name="'+enc+'">初始化</button> <button type="button" class="lnk btn-del" data-name="'+enc+'">删除</button></td></tr>';
+    h+='<tr><td>'+escapeHtml(t.name)+'</td><td>'+escapeHtml(t.barcode)+'</td><td class="num">'+fmtBytes(t.capacity_bytes)+'</td><td class="num">'+fmtBytes(t.used_bytes||0)+'</td><td>'+loc+'</td><td class="ops"><button type="button" class="lnk btn-init" data-name="'+enc+'">初始化</button> <button type="button" class="lnk btn-del" data-name="'+enc+'" title="不可恢复！">⛔ 删除</button></td></tr>';
   });
+  if(tj.truncated){h+='<tr><td colspan="6" style="text-align:center;color:var(--muted)">（已显示前 '+rows.length+' 条，共 '+tj.total+' 条；如需查看更多请使用 CLI）</td></tr>';}
   h+='</tbody></table>';w.innerHTML=h;
 }
 document.getElementById('treload').onclick=loadTapeMaintainTable;
@@ -4641,14 +4693,21 @@ document.getElementById('tmwrap').addEventListener('click',async (ev)=>{
   if(!t.classList.contains('btn-init')&&!t.classList.contains('btn-del'))return;
   const lib=document.getElementById('tlib').value;
   const name=decodeURIComponent(t.getAttribute('data-name'));
+  const errEl=document.getElementById('tme');
+  errEl.textContent='';
   if(t.classList.contains('btn-del')){
-    if(!confirm('确定删除磁带 '+name+' ?'))return;
+    if(!confirm('⚠️ 确定永久删除磁带「'+name+'」？\n此操作不可恢复，磁带数据将被清除。'))return;
+    t.disabled=true;t.textContent='删除中…';
     const {r,j}=await jpost('/api/manage/tape/delete',{library:lib,name:name});
-    if(!r.ok){document.getElementById('tme').textContent=j.error||r.status;return;}
+    t.disabled=false;t.textContent='⛔ 删除';
+    if(!r.ok){errEl.textContent=j.error||r.status;return;}
+    if(j.warning){errEl.textContent='⚠️ '+j.warning;}
   }else{
-    if(!confirm('确定初始化磁带 '+name+' ?（已写数据将丢失）'))return;
+    if(!confirm('确定初始化磁带「'+name+'」？（已写数据将丢失）'))return;
+    t.disabled=true;t.textContent='初始化中…';
     const {r,j}=await jpost('/api/manage/tape/init',{library:lib,name:name});
-    if(!r.ok){document.getElementById('tme').textContent=j.error||r.status;return;}
+    t.disabled=false;t.textContent='初始化';
+    if(!r.ok){errEl.textContent=j.error||r.status;return;}
   }
   await loadTapeMaintainTable();
   await loadMigrateTable();
@@ -4703,26 +4762,36 @@ document.getElementById('btauto').onclick=async()=>{
   if(!size){document.getElementById('te').textContent='请填写容量';return;}
   const shv=document.getElementById('tshelf').value;
   const lib=document.getElementById('tlib').value;
+  const btn=document.getElementById('btauto');
+  btn.disabled=true;btn.textContent='创建中（'+cnt+' 条）…';
   const {r,j}=await jpost('/api/manage/tape/create-auto-batch',{library:lib,shelf:shv?shv:null,count:cnt,size:size});
+  btn.disabled=false;btn.textContent='创建磁带';
   if(!r.ok){document.getElementById('te').textContent=j.error||r.status;return;}
   const ns=j.names||[];
   const span=ns.length?('自 '+ns[0]+' 至 '+ns[ns.length-1]):'';
   showToast('已创建 '+ns.length+' 条 '+span);
+  await loadTapeMaintainTable();
 };
 document.getElementById('mst').onclick=()=>{document.querySelectorAll('.cm').forEach(x=>{x.checked=true;});};
 document.getElementById('mclr').onclick=()=>{document.querySelectorAll('.cm').forEach(x=>{x.checked=false;});};
 document.getElementById('bmig').onclick=async()=>{
-  document.getElementById('me').textContent='';
+  const me=document.getElementById('me');
+  me.textContent='';
   const lib=document.getElementById('tlib').value;
   const from=document.getElementById('mfrom').value;
   const to=document.getElementById('mto').value;
-  if(!from){document.getElementById('me').textContent='请选择源货架';return;}
-  if(!to){document.getElementById('me').textContent='请选择目标货架';return;}
-  if(from===to){document.getElementById('me').textContent='源货架与目标货架须不同';return;}
+  if(!from){me.textContent='请选择源货架';return;}
+  if(!to){me.textContent='请选择目标货架';return;}
+  if(from===to){me.textContent='源货架与目标货架须不同';return;}
   const tapes=[...document.querySelectorAll('.cm:checked')].map(x=>decodeURIComponent(x.value));
-  if(!tapes.length){document.getElementById('me').textContent='请勾选要迁移的磁带';return;}
+  if(!tapes.length){me.textContent='请勾选要迁移的磁带';return;}
+  const btn=document.getElementById('bmig');
+  btn.disabled=true;btn.textContent='迁移中（'+tapes.length+' 条）…';
+  document.getElementById('mwrap').classList.add('loading-mask');
   const {r,j}=await jpost('/api/manage/tape/migrate-shelves-batch',{library:lib,from_shelf:from,to_shelf:to,tapes:tapes});
-  if(!r.ok){document.getElementById('me').textContent=j.error||r.status;return;}
+  btn.disabled=false;btn.textContent='批量迁移';
+  document.getElementById('mwrap').classList.remove('loading-mask');
+  if(!r.ok){me.textContent=j.error||r.status;return;}
   showToast('已迁移 '+tapes.length+' 条');
   await loadMigrateTable();
 };

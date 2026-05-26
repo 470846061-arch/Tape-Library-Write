@@ -3868,10 +3868,21 @@ fn search_tapes(
 }
 
 fn delete_tape(name: &str) -> Result<(), VtlError> {
-    delete_tape_in_library(&current_library_name(), name)
+    match delete_tape_in_library(&current_library_name(), name)? {
+        Some(warning) => {
+            eprintln!("Warning: {}", warning);
+            Ok(())
+        }
+        None => Ok(()),
+    }
 }
 
-pub(crate) fn delete_tape_in_library(library: &str, name: &str) -> Result<(), VtlError> {
+/// 删除磁带。返回 `Ok(None)` 表示完全成功；`Ok(Some(warning))` 表示 DB 已提交但
+/// 磁带镜像文件清理失败（孤儿文件需手工处理）；`Err` 表示操作未生效。
+pub(crate) fn delete_tape_in_library(
+    library: &str,
+    name: &str,
+) -> Result<Option<String>, VtlError> {
     log_message(&format!(
         "Deleting tape '{}' from library '{}'",
         name, library
@@ -3929,22 +3940,24 @@ pub(crate) fn delete_tape_in_library(library: &str, name: &str) -> Result<(), Vt
         return Err(VtlError::from(e));
     }
 
+    // DB 已提交——磁带记录已不可逆删除。镜像清理失败只是 warning，不应报 Err。
     if let Err(e) = fs::remove_file(&deleted_path) {
-        log_error(
-            "delete_tape_in_library",
-            &format!(
-                "DB committed but failed to remove staged tape image {}: {}",
-                deleted_path.display(),
-                e
-            ),
+        let warning = format!(
+            "DB 已删除磁带 '{}'，但镜像文件清理失败（{}）；请手工删除: {}",
+            name,
+            e,
+            deleted_path.display()
         );
-        return Err(VtlError::from(e));
+        log_error("delete_tape_in_library", &warning);
+        log_message(&format!("Deleted tape '{}' (with file warning)", name));
+        println!("Deleted tape '{}' from library '{}' (warning: orphan image)", name, library);
+        return Ok(Some(warning));
     }
 
     log_message(&format!("Successfully deleted tape '{}'", name));
     println!("Deleted tape '{}' from library '{}'", name, library);
 
-    Ok(())
+    Ok(None)
 }
 
 /// 初始化磁带：将 `used_bytes` 置 0，并把镜像文件截断为标称容量（空白带）。
