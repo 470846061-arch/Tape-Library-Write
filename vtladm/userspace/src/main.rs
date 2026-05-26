@@ -2067,6 +2067,11 @@ fn ioctl_error_benign(e: &std::io::Error) -> bool {
 /// **`VTL_SKIP_KERNEL_RELOAD=1`**: skip ioctl, script, and unchanged-spec rescan for this process.
 /// See `docs/SCSI.md` §1c / §1e / §1f.
 pub(crate) fn maybe_reload_kernel_vtl_after_db_change() -> KernelGeomSync {
+    // 测试环境绝不能触碰真实内核模块：并发 ioctl SET_INSTANCES 会导致 panic / 整机重启。
+    #[cfg(test)]
+    {
+        return KernelGeomSync::status("skipped", "cfg(test)");
+    }
     if std::env::var("VTL_SKIP_KERNEL_RELOAD").ok().as_deref() == Some("1") {
         log_message("kernel_vtl_reload_script: skipped (VTL_SKIP_KERNEL_RELOAD=1)");
         return KernelGeomSync::status("skipped", "VTL_SKIP_KERNEL_RELOAD=1");

@@ -15,6 +15,10 @@ pub(super) fn prepare_temp_vtl(prefix: &str) -> PathBuf {
     std::env::set_var("VTL_LOG_DIR", log_dir.to_str().unwrap());
     // 不读取宿主机上的 vtl.conf：测试使用 VTL_USE_ENV_ONLY=1 时仅环境变量；与生产一致时仅读取 /var/lib/vtl/vtl.conf
     std::env::set_var("VTL_USE_ENV_ONLY", "1");
+    // 禁止测试触碰真实内核模块：create_named_library 等会调用 maybe_reload_kernel_vtl_after_db_change，
+    // 若 /dev/vtl 存在（生产机），ioctl SET_INSTANCES 会拆卸并重建 SCSI host；
+    // 多个测试并行执行时并发 ioctl 会导致内核 panic / 整机重启。
+    std::env::set_var("VTL_SKIP_KERNEL_RELOAD", "1");
     super::set_current_library("");
     test_dir
 }
