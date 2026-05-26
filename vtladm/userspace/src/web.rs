@@ -1007,6 +1007,10 @@ async fn api_login(
 ) -> impl IntoResponse {
     let login_key = login_rate_key(&headers);
     if let Err(wait) = st.login_allowed(&login_key) {
+        super::log_error(
+            "api_login",
+            &format!("登录频率限制：IP={} 剩余锁定 {}s", login_key, wait.as_secs()),
+        );
         return json_cookie_response(
             StatusCode::TOO_MANY_REQUESTS,
             json!({ "error": "登录尝试过多，请稍后再试", "retry_after_secs": wait.as_secs().max(1) }),
@@ -1015,6 +1019,10 @@ async fn api_login(
     }
     if !st.verify_captcha(&body.captcha_id, body.captcha_answer.trim()) {
         st.record_login_failure(&login_key);
+        super::log_error(
+            "api_login",
+            &format!("验证码校验失败：IP={} user={}", login_key, body.username.trim()),
+        );
         return json_cookie_response(
             StatusCode::UNAUTHORIZED,
             json!({ "error": "验证码错误或已过期" }),
@@ -1026,18 +1034,37 @@ async fn api_login(
     match st.login(username, password) {
         Ok(tok) => {
             st.record_login_success(&login_key);
+            super::log_message(&format!(
+                "Web 登录成功：user={} IP={}",
+                username, login_key
+            ));
             let c = session_cookie(&tok, super::web_auth::SESSION_SECS);
             json_cookie_response(StatusCode::OK, json!({ "ok": true }), Some(&c))
         }
-        Err(super::web_auth::LoginFail::AuthFile) => json_cookie_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({
-                "error": "无法读取 Web 认证文件（web_admin.json），请在服务器执行: vtladm reset-web-auth"
-            }),
-            None,
-        ),
+        Err(super::web_auth::LoginFail::AuthFile) => {
+            super::log_error(
+                "api_login",
+                &format!(
+                    "无法读取认证文件 web_admin.json：IP={} user={} path={}",
+                    login_key,
+                    username,
+                    st.auth_file.display()
+                ),
+            );
+            json_cookie_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({
+                    "error": "无法读取 Web 认证文件（web_admin.json），请在服务器执行: vtladm reset-web-auth"
+                }),
+                None,
+            )
+        }
         Err(super::web_auth::LoginFail::BadCredentials) => {
             st.record_login_failure(&login_key);
+            super::log_error(
+                "api_login",
+                &format!("用户名或密码错误：IP={} user={}", login_key, username),
+            );
             json_cookie_response(
                 StatusCode::UNAUTHORIZED,
                 json!({
